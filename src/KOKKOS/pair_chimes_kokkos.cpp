@@ -45,6 +45,210 @@
 
 using namespace LAMMPS_NS;
 
+
+#ifdef CHIMES_KK_PROFILE
+#include <cstdlib>
+#include <iomanip>
+
+namespace {
+
+enum ChimesKKProfIndex {
+  CKP_TOTAL = 0,
+  CKP_ATOM_SYNC,
+  CKP_EV_SETUP,
+  CKP_NEIGH_ACCESS_SCATTER,
+  CKP_NEIGH_BUILD_TOTAL,
+  CKP_NEIGH_BUILD_2B,
+  CKP_NEIGH_BUILD_3B,
+  CKP_NEIGH_BUILD_4B,
+  CKP_COMPUTE_1B,
+  CKP_COMPUTE_2B,
+  CKP_COMPUTE_3B,
+  CKP_COMPUTE_4B,
+  CKP_CONTRIBUTE_F,
+  CKP_EV_ACCUM,
+  CKP_VIRIAL_FDOTR,
+  CKP_PERATOM_SYNC,
+  CKP_ATOM_MODIFIED,
+  CKP_CLEANUP,
+  CKP_NITEMS
+};
+
+static const char *ckp_names[CKP_NITEMS] = {
+  "total_compute",
+  "atom_sync",
+  "ev_setup_realloc",
+  "neigh_access_scatter_setup",
+  "mb_neigh_build_total",
+  "mb_neigh_build_2b",
+  "mb_neigh_build_3b",
+  "mb_neigh_build_4b",
+  "compute_1b",
+  "compute_2b",
+  "compute_3b",
+  "compute_4b",
+  "contribute_f",
+  "ev_global_accum",
+  "virial_fdotr",
+  "peratom_sync",
+  "atom_modified",
+  "cleanup"
+};
+
+struct ChimesKKProfileData {
+  double t[CKP_NITEMS];
+  long nsteps;
+
+  long long sum_2mers;
+  long long sum_3mers;
+  long long sum_4mers;
+
+  long long max_2mers;
+  long long max_3mers;
+  long long max_4mers;
+
+  ChimesKKProfileData() { reset(); }
+
+  void reset()
+  {
+    for (int i = 0; i < CKP_NITEMS; i++) t[i] = 0.0;
+    nsteps = 0;
+
+    sum_2mers = 0;
+    sum_3mers = 0;
+    sum_4mers = 0;
+
+    max_2mers = 0;
+    max_3mers = 0;
+    max_4mers = 0;
+  }
+};
+
+static ChimesKKProfileData ckp_data;
+
+static int ckp_every()
+{
+  static int every = -1;
+
+  if (every < 0) {
+    every = 100;
+    const char *env = std::getenv("CHIMES_KK_PROFILE_EVERY");
+    if (env) {
+      int val = std::atoi(env);
+      if (val > 0) every = val;
+    }
+  }
+
+  return every;
+}
+
+static inline void ckp_add(int idx, double dt)
+{
+  ckp_data.t[idx] += dt;
+}
+
+static void ckp_print_and_reset(MPI_Comm world, int me, int nprocs, bigint timestep)
+{
+  const int every = ckp_every();
+
+  if (ckp_data.nsteps <= 0) return;
+  if ((ckp_data.nsteps % every) != 0) return;
+
+  double local_t[CKP_NITEMS];
+  double sum_t[CKP_NITEMS];
+  double max_t[CKP_NITEMS];
+  double min_t[CKP_NITEMS];
+
+  for (int i = 0; i < CKP_NITEMS; i++)
+    local_t[i] = ckp_data.t[i];
+
+  MPI_Reduce(local_t, sum_t, CKP_NITEMS, MPI_DOUBLE, MPI_SUM, 0, world);
+  MPI_Reduce(local_t, max_t, CKP_NITEMS, MPI_DOUBLE, MPI_MAX, 0, world);
+  MPI_Reduce(local_t, min_t, CKP_NITEMS, MPI_DOUBLE, MPI_MIN, 0, world);
+
+  long long local_counts[6];
+  long long sum_counts[6];
+  long long max_counts[6];
+
+  local_counts[0] = ckp_data.sum_2mers;
+  local_counts[1] = ckp_data.sum_3mers;
+  local_counts[2] = ckp_data.sum_4mers;
+  local_counts[3] = ckp_data.max_2mers;
+  local_counts[4] = ckp_data.max_3mers;
+  local_counts[5] = ckp_data.max_4mers;
+
+  MPI_Reduce(local_counts, sum_counts, 6, MPI_LONG_LONG, MPI_SUM, 0, world);
+  MPI_Reduce(local_counts, max_counts, 6, MPI_LONG_LONG, MPI_MAX, 0, world);
+
+  if (me == 0) {
+    const double steps = (double)ckp_data.nsteps;
+    const double total_avg_per_rank = sum_t[CKP_TOTAL] / (double)nprocs;
+    const double total_per_step = total_avg_per_rank / steps;
+
+    std::cout << std::endl;
+    std::cout << "================ ChIMES/Kokkos profile ================" << std::endl;
+    std::cout << " timestep                  : " << timestep << std::endl;
+    std::cout << " accumulated compute calls  : " << ckp_data.nsteps << std::endl;
+    std::cout << " MPI ranks                  : " << nprocs << std::endl;
+    std::cout << " avg total time/step/rank   : " << std::setprecision(6)
+              << total_per_step << " s" << std::endl;
+    std::cout << std::endl;
+
+    std::cout << std::setw(32) << "region"
+              << std::setw(15) << "avg/rank(s)"
+              << std::setw(15) << "per step(s)"
+              << std::setw(12) << "% total"
+              << std::setw(15) << "min/rank(s)"
+              << std::setw(15) << "max/rank(s)"
+              << std::endl;
+
+    for (int i = 0; i < CKP_NITEMS; i++) {
+      const double avg_rank = sum_t[i] / (double)nprocs;
+      const double per_step = avg_rank / steps;
+      const double pct = (total_avg_per_rank > 0.0)
+                       ? 100.0 * avg_rank / total_avg_per_rank
+                       : 0.0;
+
+      std::cout << std::setw(32) << ckp_names[i]
+                << std::setw(15) << std::setprecision(6) << avg_rank
+                << std::setw(15) << std::setprecision(6) << per_step
+                << std::setw(12) << std::setprecision(4) << pct
+                << std::setw(15) << std::setprecision(6) << min_t[i]
+                << std::setw(15) << std::setprecision(6) << max_t[i]
+                << std::endl;
+    }
+
+    const double denom = steps * (double)nprocs;
+
+    std::cout << std::endl;
+    std::cout << " average list sizes per rank per step:" << std::endl;
+    std::cout << "   2mers avg/max : "
+              << (double)sum_counts[0] / denom << " / "
+              << max_counts[3] << std::endl;
+    std::cout << "   3mers avg/max : "
+              << (double)sum_counts[1] / denom << " / "
+              << max_counts[4] << std::endl;
+    std::cout << "   4mers avg/max : "
+              << (double)sum_counts[2] / denom << " / "
+              << max_counts[5] << std::endl;
+
+    std::cout << "========================================================" << std::endl;
+    std::cout << std::endl;
+  }
+
+  ckp_data.reset();
+}
+
+#define CKP_START(name) \
+  Kokkos::fence();      \
+  Kokkos::Timer name
+
+#define CKP_STOP(idx, name) \
+  Kokkos::fence();          \
+  ckp_add((idx), name.seconds())
+
+}  // namespace
+#endif
 /* ---------------------------------------------------------------------- */
 
 template<class DeviceType>
@@ -58,9 +262,6 @@ PairCHIMESKokkos<DeviceType>::PairCHIMESKokkos(LAMMPS *lmp) : PairCHIMES(lmp)
   datamask_read = EMPTY_MASK;
   datamask_modify = EMPTY_MASK;
 
-#ifdef TABULATION
- error->all(FLERR,"Cannot (yet) use tabulation with pair_style chimes/kk");
-#endif
 
 #ifdef FINGERPRINT
  error->all(FLERR,"Cannot (yet) use fingerprint with pair_style chimes/kk");
@@ -190,6 +391,9 @@ KK_FLOAT PairCHIMESKokkos<DeviceType>::get_dist(int i, int j) const
 template<class DeviceType>
 void PairCHIMESKokkos<DeviceType>::build_mb_neighlists()
 {
+#ifdef CHIMES_KK_PROFILE
+  CKP_START(ckp_timer_neigh_total);
+#endif
   if (maxcut_3b > maxcut_2b)
     error->all(FLERR,"KOKKOS ChIMES assumes 2-body cutoffs >= 3-body cutoffs");
 
@@ -208,7 +412,9 @@ void PairCHIMESKokkos<DeviceType>::build_mb_neighlists()
     LAMMPS_NS::MemKK::realloc_kokkos(d_neighborlist_4mers,"chimes:neighborlist_4mers",max_4mers);
 
   // try building 2-body list, resize if necessary
-
+#ifdef CHIMES_KK_PROFILE
+  CKP_START(ckp_timer_neigh_2b);
+#endif
   int resize = 1;
   while (resize) {
     resize = 0;
@@ -222,8 +428,13 @@ void PairCHIMESKokkos<DeviceType>::build_mb_neighlists()
       LAMMPS_NS::MemKK::realloc_kokkos(d_neighborlist_2mers,"chimes:neighborlist_2mers",max_2mers);
     }
   }
-
+#ifdef CHIMES_KK_PROFILE
+  CKP_STOP(CKP_NEIGH_BUILD_2B, ckp_timer_neigh_2b);
+#endif
   // try building 3-body list, resize if necessary
+#ifdef CHIMES_KK_PROFILE
+  CKP_START(ckp_timer_neigh_3b);
+#endif
 
   if (chimes_calculatorKK.poly_orders[1] > 0 || chimes_calculatorKK.poly_orders[2] > 0) {
     resize = 1;
@@ -240,9 +451,13 @@ void PairCHIMESKokkos<DeviceType>::build_mb_neighlists()
       }
     }
   }
-
+#ifdef CHIMES_KK_PROFILE
+  CKP_STOP(CKP_NEIGH_BUILD_3B, ckp_timer_neigh_3b);
+#endif
   // try building 4-body list, resize if necessary
-
+#ifdef CHIMES_KK_PROFILE
+  CKP_START(ckp_timer_neigh_4b);
+#endif
   if (chimes_calculatorKK.poly_orders[2] > 0) {
     resize = 1;
     while (resize) {
@@ -265,6 +480,12 @@ void PairCHIMESKokkos<DeviceType>::build_mb_neighlists()
       }
     }
   }
+#ifdef CHIMES_KK_PROFILE
+  CKP_STOP(CKP_NEIGH_BUILD_4B, ckp_timer_neigh_4b);
+#endif
+#ifdef CHIMES_KK_PROFILE
+  CKP_STOP(CKP_NEIGH_BUILD_TOTAL, ckp_timer_neigh_total);
+#endif
 }
 
 /* ---------------------------------------------------------------------- */
@@ -508,9 +729,16 @@ void PairCHIMESKokkos<DeviceType>::operator() (TagPairCHIMESComputeNeigh4Body, c
 template<class DeviceType>
 void PairCHIMESKokkos<DeviceType>::compute(int eflag_in, int vflag_in)
 {
+#ifdef CHIMES_KK_PROFILE
+  CKP_START(ckp_timer_total);
+#endif
   copymode = 1;
 
   // Vars for access to chimesFF compute_XB functions
+
+#ifdef CHIMES_KK_PROFILE
+  CKP_START(ckp_timer_atom_sync);
+#endif
 
   atomKK->sync(execution_space,X_MASK|F_MASK|TYPE_MASK|TAG_MASK);
 
@@ -519,8 +747,14 @@ void PairCHIMESKokkos<DeviceType>::compute(int eflag_in, int vflag_in)
   type = atomKK->k_type.view<DeviceType>();
   tag = atomKK->k_tag.view<DeviceType>();
 
-  // Set up vars controlling if energy/pressure (virial) contributions are computed
+#ifdef CHIMES_KK_PROFILE
+  CKP_STOP(CKP_ATOM_SYNC, ckp_timer_atom_sync);
+#endif
 
+  // Set up vars controlling if energy/pressure (virial) contributions are computed
+#ifdef CHIMES_KK_PROFILE
+  CKP_START(ckp_timer_ev_setup);
+#endif
   eflag = eflag_in;
   vflag = vflag_in;
 
@@ -551,7 +785,12 @@ void PairCHIMESKokkos<DeviceType>::compute(int eflag_in, int vflag_in)
 
   chimes_calculatorKK.eflag = eflag_either;
   chimes_calculatorKK.vflag = vflag_either;
-
+#ifdef CHIMES_KK_PROFILE
+  CKP_STOP(CKP_EV_SETUP, ckp_timer_ev_setup);
+#endif
+#ifdef CHIMES_KK_PROFILE
+  CKP_START(ckp_timer_neigh_access_scatter);
+#endif
   ////////////////////////////////////////
   // Access to (2-body) neighbor list vars
   ////////////////////////////////////////
@@ -572,7 +811,9 @@ void PairCHIMESKokkos<DeviceType>::compute(int eflag_in, int vflag_in)
     ndup_eatom = Kokkos::Experimental::create_scatter_view<Kokkos::Experimental::ScatterSum, Kokkos::Experimental::ScatterNonDuplicated>(d_eatom);
     ndup_vatom = Kokkos::Experimental::create_scatter_view<Kokkos::Experimental::ScatterSum, Kokkos::Experimental::ScatterNonDuplicated>(d_vatom);
   }
-
+#ifdef CHIMES_KK_PROFILE
+  CKP_STOP(CKP_NEIGH_ACCESS_SCATTER, ckp_timer_neigh_access_scatter);
+#endif
   // Build the ChIMES many-body neighbor lists.. only do so when LAMMPS neighborlist has been updated
 
   if (0 && chimes_calculatorKK.rank == 0)
@@ -588,7 +829,9 @@ void PairCHIMESKokkos<DeviceType>::compute(int eflag_in, int vflag_in)
   }
 
   EV_FLOAT ev, ev_tmp;
-
+#ifdef CHIMES_KK_PROFILE
+  CKP_START(ckp_timer_compute_1b);
+#endif
   //Compute1Body
   {
     if (eflag_either) {
@@ -602,7 +845,12 @@ void PairCHIMESKokkos<DeviceType>::compute(int eflag_in, int vflag_in)
     }
   }
   ev += ev_tmp;
-
+#ifdef CHIMES_KK_PROFILE
+  CKP_STOP(CKP_COMPUTE_1B, ckp_timer_compute_1b);
+#endif
+#ifdef CHIMES_KK_PROFILE
+  CKP_START(ckp_timer_compute_2b);
+#endif
   //Compute2Body
   {
     if (evflag) {
@@ -624,7 +872,12 @@ void PairCHIMESKokkos<DeviceType>::compute(int eflag_in, int vflag_in)
     }
   }
   ev += ev_tmp;
-
+#ifdef CHIMES_KK_PROFILE
+  CKP_STOP(CKP_COMPUTE_2B, ckp_timer_compute_2b);
+#endif
+#ifdef CHIMES_KK_PROFILE
+  CKP_START(ckp_timer_compute_3b);
+#endif
   //Compute3Body
   if (chimes_calculatorKK.poly_orders[1] > 0)
   {
@@ -647,7 +900,12 @@ void PairCHIMESKokkos<DeviceType>::compute(int eflag_in, int vflag_in)
     }
   }
   ev += ev_tmp;
-
+#ifdef CHIMES_KK_PROFILE
+  CKP_STOP(CKP_COMPUTE_3B, ckp_timer_compute_3b);
+#endif
+#ifdef CHIMES_KK_PROFILE
+  CKP_START(ckp_timer_compute_4b);
+#endif
   //Compute4Body
   if (chimes_calculatorKK.poly_orders[2] > 0)
   {
@@ -670,9 +928,23 @@ void PairCHIMESKokkos<DeviceType>::compute(int eflag_in, int vflag_in)
     }
   }
   ev += ev_tmp;
+#ifdef CHIMES_KK_PROFILE
+  CKP_STOP(CKP_COMPUTE_4B, ckp_timer_compute_4b);
+#endif
+#ifdef CHIMES_KK_PROFILE
+  CKP_START(ckp_timer_contribute_f);
+#endif
 
   if (need_dup)
     Kokkos::Experimental::contribute(f, dup_f);
+
+#ifdef CHIMES_KK_PROFILE
+  CKP_STOP(CKP_CONTRIBUTE_F, ckp_timer_contribute_f);
+#endif
+
+#ifdef CHIMES_KK_PROFILE
+  CKP_START(ckp_timer_ev_accum);
+#endif
 
   if (eflag_global) eng_vdwl += ev.evdwl;
   if (vflag_global) {
@@ -684,7 +956,23 @@ void PairCHIMESKokkos<DeviceType>::compute(int eflag_in, int vflag_in)
     virial[5] += ev.v[5];
   }
 
+#ifdef CHIMES_KK_PROFILE
+  CKP_STOP(CKP_EV_ACCUM, ckp_timer_ev_accum);
+#endif
+
+#ifdef CHIMES_KK_PROFILE
+  CKP_START(ckp_timer_fdotr);
+#endif
+
   if (vflag_fdotr) pair_virial_fdotr_compute(this);
+
+#ifdef CHIMES_KK_PROFILE
+  CKP_STOP(CKP_VIRIAL_FDOTR, ckp_timer_fdotr);
+#endif
+
+#ifdef CHIMES_KK_PROFILE
+  CKP_START(ckp_timer_peratom_sync);
+#endif
 
   if (eflag_atom) {
     k_eatom.template modify<DeviceType>();
@@ -698,7 +986,22 @@ void PairCHIMESKokkos<DeviceType>::compute(int eflag_in, int vflag_in)
     k_vatom.sync_host();
   }
 
+#ifdef CHIMES_KK_PROFILE
+  CKP_STOP(CKP_PERATOM_SYNC, ckp_timer_peratom_sync);
+#endif
+#ifdef CHIMES_KK_PROFILE
+  CKP_START(ckp_timer_atom_modified);
+#endif
+
   atomKK->modified(execution_space,F_MASK);
+
+#ifdef CHIMES_KK_PROFILE
+  CKP_STOP(CKP_ATOM_MODIFIED, ckp_timer_atom_modified);
+#endif
+
+#ifdef CHIMES_KK_PROFILE
+  CKP_START(ckp_timer_cleanup);
+#endif
 
   copymode = 0;
 
@@ -708,6 +1011,28 @@ void PairCHIMESKokkos<DeviceType>::compute(int eflag_in, int vflag_in)
     dup_f     = {};
     dup_vatom = {};
   }
+
+#ifdef CHIMES_KK_PROFILE
+  CKP_STOP(CKP_CLEANUP, ckp_timer_cleanup);
+#endif
+#ifdef CHIMES_KK_PROFILE
+  CKP_STOP(CKP_TOTAL, ckp_timer_total);
+
+  ckp_data.nsteps++;
+
+  ckp_data.sum_2mers += (long long)size_2mers;
+  ckp_data.sum_3mers += (long long)size_3mers;
+  ckp_data.sum_4mers += (long long)size_4mers;
+
+  if ((long long)size_2mers > ckp_data.max_2mers)
+    ckp_data.max_2mers = (long long)size_2mers;
+  if ((long long)size_3mers > ckp_data.max_3mers)
+    ckp_data.max_3mers = (long long)size_3mers;
+  if ((long long)size_4mers > ckp_data.max_4mers)
+    ckp_data.max_4mers = (long long)size_4mers;
+
+  ckp_print_and_reset(world, comm->me, comm->nprocs, update->ntimestep);
+#endif
 }
 
 /* ---------------------------------------------------------------------- */
@@ -787,7 +1112,10 @@ void PairCHIMESKokkos<DeviceType>::operator() (TagPairCHIMESCompute2Body<NEIGHFL
   KK_FLOAT stensor[6];
   for (int n = 0; n < 6; n++) stensor[n] = 0.0;
 
-  chimes_calculatorKK.compute_2B(dist, dr, typ_idxs_2b, force_2b, stensor, energy);      // Auto-updates badness
+  if (chimes_calculatorKK.tabulate_2B_kk)
+    chimes_calculatorKK.compute_2B_tab(dist, dr, typ_idxs_2b, force_2b, stensor, energy);
+  else
+    chimes_calculatorKK.compute_2B(dist, dr, typ_idxs_2b, force_2b, stensor, energy);
 
   for (int idx = 0; idx < 3; idx++) {
     a_f(i,idx) += force_2b[idx];
@@ -860,7 +1188,12 @@ void PairCHIMESKokkos<DeviceType>::operator() (TagPairCHIMESCompute3Body<NEIGHFL
   KK_FLOAT stensor[6];
   for (int n = 0; n < 6; n++) stensor[n] = 0.0;
 
-  chimes_calculatorKK.compute_3B(dist_3b, dr_3b, typ_idxs_3b, force_3b, stensor, energy);
+  if (chimes_calculatorKK.tabulate_3B_kk)
+    chimes_calculatorKK.compute_3B_tab(dist_3b, dr_3b, typ_idxs_3b, force_3b, stensor, energy);
+  else if (chimes_calculatorKK.tabulate_3B_cp_kk)
+    chimes_calculatorKK.compute_3B_cp_tab(dist_3b, dr_3b, typ_idxs_3b, force_3b, stensor, energy);
+  else
+    chimes_calculatorKK.compute_3B(dist_3b, dr_3b, typ_idxs_3b, force_3b, stensor, energy);
 
   for (int idx = 0; idx < 3; idx++)
   {
@@ -942,7 +1275,21 @@ void PairCHIMESKokkos<DeviceType>::operator() (TagPairCHIMESCompute4Body<NEIGHFL
   KK_FLOAT stensor[6];
   for (int n = 0; n < 6; n++) stensor[n] = 0.0;
 
-  chimes_calculatorKK.compute_4B(dist_4b, dr_4b, typ_idxs_4b, force_4b, stensor, energy);
+  if (chimes_calculatorKK.tabulate_4B_cp_direct_kk)
+    chimes_calculatorKK.compute_4B_cp_direct(
+        dist_4b, dr_4b, typ_idxs_4b, force_4b, stensor, energy);
+  else if (chimes_calculatorKK.tabulate_4B_cp_kk)
+    chimes_calculatorKK.compute_4B_cp_tab(
+        dist_4b, dr_4b, typ_idxs_4b, force_4b, stensor, energy);
+  else if (chimes_calculatorKK.tabulate_4B_svd4x2_kk)
+    chimes_calculatorKK.compute_4B_svd4x2_tab(
+        dist_4b, dr_4b, typ_idxs_4b, force_4b, stensor, energy);
+  else if (chimes_calculatorKK.tabulate_4B_svd3x3_kk)
+    chimes_calculatorKK.compute_4B_svd3x3_tab(
+        dist_4b, dr_4b, typ_idxs_4b, force_4b, stensor, energy);
+  else
+    chimes_calculatorKK.compute_4B(
+        dist_4b, dr_4b, typ_idxs_4b, force_4b, stensor, energy);
 
   for (int idx = 0; idx < 3; idx++) {
     a_f(i,idx) += force_4b[idx];

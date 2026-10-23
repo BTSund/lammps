@@ -23,9 +23,9 @@
 
 #define pi 3.14159265359
 
-constexpr int MAX_2B_POLY = 13;
-constexpr int MAX_3B_POLY = 9;
-constexpr int MAX_4B_POLY = 4;
+constexpr int MAX_2B_POLY = 40;
+constexpr int MAX_3B_POLY = 20;
+constexpr int MAX_4B_POLY = 10;
 
 using namespace std;
 
@@ -37,6 +37,9 @@ using namespace std;
 
 
 #define CHDIM 3 // The number of spatial dimensions.
+#ifdef USE_DISTANCE_TENSOR
+#undef USE_DISTANCE_TENSOR
+#endif
 #define USE_DISTANCE_TENSOR 0 // Use tensor of distances in computing stresses.
 
 template<class DeviceType>
@@ -52,6 +55,307 @@ class chimesFFKokkos : public chimesFF
 
   int d_poly_orders[3];    // [bodiedness-1]; i.e. 12 = 2-body only, 12th order; 12 5 = 2+3-body, 0 5 = 3-body only, 5th order
 
+
+  bool tabulate_4B_svd3x3_corner_kk = false;
+  bool tabulate_4B_svd4x2_corner_kk = false;
+  bool tabulate_2B_kk = false;
+  bool tabulate_3B_kk = false;
+  bool tabulate_4B_svd3x3_kk = false;
+  bool tabulate_4B_svd4x2_kk = false;
+
+  bool tabulate_4B_cp_kk = false;
+  bool tabulate_4B_cp_direct_kk = false;
+  bool tabulate_3B_cp_kk = false;
+
+  // CP 1D tables on the device (precision set by chimes_tab_real in chimesFF.h)
+  typedef Kokkos::View<chimes_tab_real*, DeviceType> t_cp_tab_1d;
+
+  // ------------------------------------------------------------------
+  // CP 1D 4B tabulation, Kokkos packed
+  // ------------------------------------------------------------------
+
+  typename AT::t_int_1d d_tab4b_cp_rank;
+  typename AT::t_int_1d_const_um c_tab4b_cp_rank;
+
+  typename AT::t_int_2d d_tab4b_cp_canon_to_param; // [quad][6]
+  typename AT::t_int_2d_const_um c_tab4b_cp_canon_to_param;
+
+  typename AT::t_int_2d d_tab4b_cp_ngrid;          // [quad][6]
+  typename AT::t_int_2d_const_um c_tab4b_cp_ngrid;
+
+  typename AT::t_int_2d d_tab4b_cp_offset;         // [quad][6]
+  typename AT::t_int_2d_const_um c_tab4b_cp_offset;
+
+  typename AT::t_kkfloat_2d d_tab4b_cp_r0;         // [quad][6]
+  typename AT::t_kkfloat_2d_const_um c_tab4b_cp_r0;
+
+  typename AT::t_kkfloat_2d d_tab4b_cp_dr;         // [quad][6]
+  typename AT::t_kkfloat_2d_const_um c_tab4b_cp_dr;
+
+  typename AT::t_kkfloat_2d d_tab4b_cp_invdr;      // [quad][6]
+  typename AT::t_kkfloat_2d_const_um c_tab4b_cp_invdr;
+
+  // Interleaved like the host tables: for a slot starting at offset off,
+  //   vd[off + row*2*R + q]     = value      of rank term q at row
+  //   vd[off + row*2*R + R + q] = derivative of rank term q at row
+  t_cp_tab_1d d_tab4b_cp_vd;
+
+  // Cubic-Hermite weights for one CP 1D table lookup (3B and 4B), with the
+  // exact continuation below the first grid point; returns the row index.
+  KOKKOS_INLINE_FUNCTION
+  int cp1d_weights(const KK_FLOAT r, const KK_FLOAT r0, const KK_FLOAT h, const KK_FLOAT invh, const int ngrid, const KK_FLOAT rc, KK_FLOAT* wv, KK_FLOAT* wd) const;
+
+  KOKKOS_INLINE_FUNCTION
+  void compute_4B_cp_tab(
+      const KK_FLOAT* dx,
+      const KK_FLOAT* dr,
+      const int* typ_idxs,
+      KK_FLOAT* force,
+      KK_FLOAT* stress,
+      KK_FLOAT& energy) const;
+
+  // ------------------------------------------------------------------
+  // Direct/on-the-fly CP 4B factors, Kokkos packed
+  // ------------------------------------------------------------------
+
+  typename AT::t_int_1d d_tab4b_cp_direct_rank;
+  typename AT::t_int_1d_const_um c_tab4b_cp_direct_rank;
+
+  typename AT::t_int_2d d_tab4b_cp_direct_canon_to_param; // [quad][6]
+  typename AT::t_int_2d_const_um c_tab4b_cp_direct_canon_to_param;
+
+  typename AT::t_int_2d d_tab4b_cp_direct_orders;         // [quad][6]
+  typename AT::t_int_2d_const_um c_tab4b_cp_direct_orders;
+
+  typename AT::t_int_2d d_tab4b_cp_direct_offset;         // [quad][6]
+  typename AT::t_int_2d_const_um c_tab4b_cp_direct_offset;
+
+  typename AT::t_kkfloat_1d d_tab4b_cp_direct_factor;
+  typename AT::t_kkfloat_1d_const_um c_tab4b_cp_direct_factor;
+
+  KOKKOS_INLINE_FUNCTION
+  void compute_4B_cp_direct(
+      const KK_FLOAT* dx,
+      const KK_FLOAT* dr,
+      const int* typ_idxs,
+      KK_FLOAT* force,
+      KK_FLOAT* stress,
+      KK_FLOAT& energy) const;
+
+  // ------------------------------------------------------------------
+  // CP 1D 3B tabulation, Kokkos packed (same layout as the 4B CP tables;
+  // a shared symmetric table is stored once and used by all three slots)
+  // ------------------------------------------------------------------
+
+  typename AT::t_int_1d d_tab3b_cp_rank;            // [trip]
+  typename AT::t_int_1d_const_um c_tab3b_cp_rank;
+
+  typename AT::t_int_2d d_tab3b_cp_canon_to_param;  // [trip][3]
+  typename AT::t_int_2d_const_um c_tab3b_cp_canon_to_param;
+
+  typename AT::t_int_2d d_tab3b_cp_ngrid;           // [trip][3]
+  typename AT::t_int_2d_const_um c_tab3b_cp_ngrid;
+
+  typename AT::t_int_2d d_tab3b_cp_offset;          // [trip][3]
+  typename AT::t_int_2d_const_um c_tab3b_cp_offset;
+
+  typename AT::t_kkfloat_2d d_tab3b_cp_r0;          // [trip][3]
+  typename AT::t_kkfloat_2d_const_um c_tab3b_cp_r0;
+
+  typename AT::t_kkfloat_2d d_tab3b_cp_dr;          // [trip][3]
+  typename AT::t_kkfloat_2d_const_um c_tab3b_cp_dr;
+
+  typename AT::t_kkfloat_2d d_tab3b_cp_invdr;       // [trip][3]
+  typename AT::t_kkfloat_2d_const_um c_tab3b_cp_invdr;
+
+  t_cp_tab_1d d_tab3b_cp_vd;
+
+  KOKKOS_INLINE_FUNCTION
+  void compute_3B_cp_tab(const KK_FLOAT* dx, const KK_FLOAT* dr, const int* typ_idxs, KK_FLOAT* force, KK_FLOAT* stress, KK_FLOAT& energy) const;
+
+    typename AT::t_int_1d d_tab2b_n;
+  typename AT::t_int_1d_const_um c_tab2b_n;
+
+  typename AT::t_kkfloat_1d d_tab2b_r0;
+  typename AT::t_kkfloat_1d_const_um c_tab2b_r0;
+
+  typename AT::t_kkfloat_1d d_tab2b_dr;
+  typename AT::t_kkfloat_1d_const_um c_tab2b_dr;
+
+  typename AT::t_kkfloat_1d d_tab2b_invdr;
+  typename AT::t_kkfloat_1d_const_um c_tab2b_invdr;
+
+  typename AT::t_int_1d d_tab2b_offset;
+  typename AT::t_int_1d_const_um c_tab2b_offset;
+
+  typename Kokkos::View<float*> d_tab2b_e;
+  typename Kokkos::View<float*, typename AT::t_kkfloat_1d::array_layout, device_type,
+                        Kokkos::MemoryTraits<Kokkos::Unmanaged> > c_tab2b_e;
+
+  typename Kokkos::View<float*> d_tab2b_f;
+  typename Kokkos::View<float*, typename AT::t_kkfloat_1d::array_layout, device_type,
+                        Kokkos::MemoryTraits<Kokkos::Unmanaged> > c_tab2b_f;
+
+
+
+
+    typename AT::t_int_1d d_tab3b_n;
+  typename AT::t_int_1d_const_um c_tab3b_n;
+
+  typename AT::t_kkfloat_1d d_tab3b_r0;
+  typename AT::t_kkfloat_1d_const_um c_tab3b_r0;
+
+  typename AT::t_kkfloat_1d d_tab3b_dr;
+  typename AT::t_kkfloat_1d_const_um c_tab3b_dr;
+
+  typename AT::t_kkfloat_1d d_tab3b_invdr;
+  typename AT::t_kkfloat_1d_const_um c_tab3b_invdr;
+
+  typename AT::t_int_1d d_tab3b_offset;
+  typename AT::t_int_1d_const_um c_tab3b_offset;
+
+  // map canonical slot -> parameter slot for each tripidx, length 3
+  typename AT::t_int_2d d_tab3b_canon_to_param;
+  typename AT::t_int_2d_const_um c_tab3b_canon_to_param;
+
+  Kokkos::View<float*> d_tab3b_e;
+  Kokkos::View<float*> d_tab3b_f0;
+  Kokkos::View<float*> d_tab3b_f1;
+  Kokkos::View<float*> d_tab3b_f2;
+
+  typename AT::t_int_1d d_tab4b_svd3_rank;
+  typename AT::t_int_1d_const_um c_tab4b_svd3_rank;
+
+  typename AT::t_int_1d d_tab4b_svd3_ngrid;
+  typename AT::t_int_1d_const_um c_tab4b_svd3_ngrid;
+
+  typename AT::t_int_1d d_tab4b_svd3_offset_left;
+  typename AT::t_int_1d_const_um c_tab4b_svd3_offset_left;
+
+  typename AT::t_int_1d d_tab4b_svd3_offset_right;
+  typename AT::t_int_1d_const_um c_tab4b_svd3_offset_right;
+
+  typename AT::t_kkfloat_2d d_tab4b_svd3_r0_left;    // [quad][3]
+  typename AT::t_kkfloat_2d_const_um c_tab4b_svd3_r0_left;
+
+  typename AT::t_kkfloat_2d d_tab4b_svd3_dr_left;
+  typename AT::t_kkfloat_2d_const_um c_tab4b_svd3_dr_left;
+
+  typename AT::t_kkfloat_2d d_tab4b_svd3_invdr_left;
+  typename AT::t_kkfloat_2d_const_um c_tab4b_svd3_invdr_left;
+
+  typename AT::t_kkfloat_2d d_tab4b_svd3_r0_right;
+  typename AT::t_kkfloat_2d_const_um c_tab4b_svd3_r0_right;
+
+  typename AT::t_kkfloat_2d d_tab4b_svd3_dr_right;
+  typename AT::t_kkfloat_2d_const_um c_tab4b_svd3_dr_right;
+
+  typename AT::t_kkfloat_2d d_tab4b_svd3_invdr_right;
+  typename AT::t_kkfloat_2d_const_um c_tab4b_svd3_invdr_right;
+
+  typename AT::t_int_2d d_tab4b_svd3_canon_to_param; // [quad][6]
+  typename AT::t_int_2d_const_um c_tab4b_svd3_canon_to_param;
+
+  Kokkos::View<float*> d_tab4b_svd3_left_val;
+  Kokkos::View<float*> d_tab4b_svd3_left_d0;
+  Kokkos::View<float*> d_tab4b_svd3_left_d1;
+  Kokkos::View<float*> d_tab4b_svd3_left_d2;
+
+  Kokkos::View<float*> d_tab4b_svd3_right_val;
+  Kokkos::View<float*> d_tab4b_svd3_right_d0;
+  Kokkos::View<float*> d_tab4b_svd3_right_d1;
+  Kokkos::View<float*> d_tab4b_svd3_right_d2;
+
+
+    typename AT::t_int_1d d_tab4b_svd42_rank;
+  typename AT::t_int_1d_const_um c_tab4b_svd42_rank;
+
+  typename AT::t_int_1d d_tab4b_svd42_ngrid_left;
+  typename AT::t_int_1d_const_um c_tab4b_svd42_ngrid_left;
+
+  typename AT::t_int_1d d_tab4b_svd42_ngrid_right;
+  typename AT::t_int_1d_const_um c_tab4b_svd42_ngrid_right;
+
+  typename AT::t_int_1d d_tab4b_svd42_offset_left;
+  typename AT::t_int_1d_const_um c_tab4b_svd42_offset_left;
+
+  typename AT::t_int_1d d_tab4b_svd42_offset_right;
+  typename AT::t_int_1d_const_um c_tab4b_svd42_offset_right;
+
+  typename AT::t_kkfloat_2d d_tab4b_svd42_r0_left;    // [quad][4]
+  typename AT::t_kkfloat_2d_const_um c_tab4b_svd42_r0_left;
+
+  typename AT::t_kkfloat_2d d_tab4b_svd42_dr_left;
+  typename AT::t_kkfloat_2d_const_um c_tab4b_svd42_dr_left;
+
+  typename AT::t_kkfloat_2d d_tab4b_svd42_invdr_left;
+  typename AT::t_kkfloat_2d_const_um c_tab4b_svd42_invdr_left;
+
+  typename AT::t_kkfloat_2d d_tab4b_svd42_r0_right;   // [quad][2]
+  typename AT::t_kkfloat_2d_const_um c_tab4b_svd42_r0_right;
+
+  typename AT::t_kkfloat_2d d_tab4b_svd42_dr_right;
+  typename AT::t_kkfloat_2d_const_um c_tab4b_svd42_dr_right;
+
+  typename AT::t_kkfloat_2d d_tab4b_svd42_invdr_right;
+  typename AT::t_kkfloat_2d_const_um c_tab4b_svd42_invdr_right;
+
+  typename AT::t_int_2d d_tab4b_svd42_canon_to_param; // [quad][6]
+  typename AT::t_int_2d_const_um c_tab4b_svd42_canon_to_param;
+
+  Kokkos::View<float*> d_tab4b_svd42_left_val;
+  Kokkos::View<float*> d_tab4b_svd42_left_d0;
+  Kokkos::View<float*> d_tab4b_svd42_left_d1;
+  Kokkos::View<float*> d_tab4b_svd42_left_d2;
+  Kokkos::View<float*> d_tab4b_svd42_left_d3;
+
+  Kokkos::View<float*> d_tab4b_svd42_right_val;
+  Kokkos::View<float*> d_tab4b_svd42_right_d0;
+  Kokkos::View<float*> d_tab4b_svd42_right_d1;
+
+  static constexpr int MAX_SVD_RANK = 256;
+
+
+  KOKKOS_INLINE_FUNCTION
+  KK_FLOAT interp_tab2b_linear(int pair_idx, KK_FLOAT r, const float *tab) const;
+
+  KOKKOS_INLINE_FUNCTION
+  void compute_2B_tab(const KK_FLOAT dx, const KK_FLOAT* dr, const int* typ_idxs,
+                      KK_FLOAT* force, KK_FLOAT* stress, KK_FLOAT& energy) const;
+
+
+  KOKKOS_INLINE_FUNCTION
+  void interp_tab3b_linear(int tripidx, const KK_FLOAT *rquery,
+                           KK_FLOAT &e, KK_FLOAT &d0, KK_FLOAT &d1, KK_FLOAT &d2) const;
+
+  KOKKOS_INLINE_FUNCTION
+  void compute_3B_tab(const KK_FLOAT* dx, const KK_FLOAT* dr, const int* typ_idxs,
+                      KK_FLOAT* force, KK_FLOAT* stress, KK_FLOAT& energy) const;
+
+
+    KOKKOS_INLINE_FUNCTION
+  void interp_svd3x3_side_linear(
+      int quadidx, bool left_side, const KK_FLOAT *rquery,
+      KK_FLOAT *val, KK_FLOAT *d0, KK_FLOAT *d1, KK_FLOAT *d2) const;
+
+  KOKKOS_INLINE_FUNCTION
+  void compute_4B_svd3x3_tab(const KK_FLOAT* dx, const KK_FLOAT* dr, const int* typ_idxs,
+                             KK_FLOAT* force, KK_FLOAT* stress, KK_FLOAT& energy) const;
+
+
+    KOKKOS_INLINE_FUNCTION
+  void interp_svd4x2_left_linear(
+      int quadidx, const KK_FLOAT *rquery,
+      KK_FLOAT *val, KK_FLOAT *d0, KK_FLOAT *d1, KK_FLOAT *d2, KK_FLOAT *d3) const;
+
+  KOKKOS_INLINE_FUNCTION
+  void interp_svd4x2_right_linear(
+      int quadidx, const KK_FLOAT *rquery,
+      KK_FLOAT *val, KK_FLOAT *d0, KK_FLOAT *d1) const;
+
+  KOKKOS_INLINE_FUNCTION
+  void compute_4B_svd4x2_tab(const KK_FLOAT* dx, const KK_FLOAT* dr, const int* typ_idxs,
+                             KK_FLOAT* force, KK_FLOAT* stress, KK_FLOAT& energy) const;
   ////////////////////////
   // Functions
   ////////////////////////
@@ -60,6 +364,9 @@ class chimesFFKokkos : public chimesFF
   ~chimesFFKokkos();
 
   void read_parameters(string paramfile) override;
+
+  // Frees the host copies of tables already packed into device views
+  void release_host_tables();
 
   KOKKOS_INLINE_FUNCTION
   void compute_1B(const int typ_idx, KK_FLOAT & energy) const;

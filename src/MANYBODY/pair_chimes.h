@@ -114,11 +114,11 @@ class PairCHIMES : public Pair {
 
   // Functions I haven't worked on
 
-  void write_restart();
-  void read_restart();
-  void write_restart_settings();
-  void read_restart_settings();
-  void single();
+	void write_restart(FILE *) override;
+	void read_restart(FILE *) override;
+	void write_restart_settings(FILE *) override;
+	void read_restart_settings(FILE *) override;
+	double single(int, int, int, int, double, double, double, double &) override;
 };
 }    // namespace LAMMPS_NS
 

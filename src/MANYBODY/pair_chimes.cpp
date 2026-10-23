@@ -697,8 +697,11 @@ void PairCHIMES::ev_tally_mb(int ninteractionatoms, int npairs, int atmpairidxls
   }
 }
 
-void PairCHIMES::write_restart() {}
-void PairCHIMES::read_restart() {}
-void PairCHIMES::write_restart_settings() {}
-void PairCHIMES::read_restart_settings() {}
-void PairCHIMES::single() {}
+void PairCHIMES::write_restart(FILE *) {}
+void PairCHIMES::read_restart(FILE *) {}
+void PairCHIMES::write_restart_settings(FILE *) {}
+void PairCHIMES::read_restart_settings(FILE *) {}
+double PairCHIMES::single(int, int, int, int, double, double, double, double &)
+{
+  return 0.0;
+}
